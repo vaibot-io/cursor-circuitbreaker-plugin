@@ -36,9 +36,10 @@ To recover a lost key: run `vaibot login` (re-issues a key via your session) or 
 
 ## Plugin structure
 
-Per Cursor's [plugin reference](https://cursor.com/docs/reference/plugins), this repo is a single plugin:
+Per Cursor's [plugin reference](https://cursor.com/docs/reference/plugins):
 
 - **`.cursor-plugin/plugin.json`** — the required plugin manifest (`name`, version, description, `hooks` path).
+- **`.cursor-plugin/marketplace.json`** — marketplace manifest listing this plugin (`source: "."`); Cursor's add-a-repo flow expects it.
 - **`hooks/hooks.json`** — the hook registration (auto-discovered), pointing at `scripts/pre-tool-use.mjs` (before Shell/MCP, `failClosed`) and `scripts/post-tool-use.mjs` (after).
 
 ## Install / test locally

@@ -1,0 +1,24 @@
+{
+  "name": "vaibot",
+  "owner": {
+    "name": "Campbell Labs LLC",
+    "email": "briantacampbell@gmail.com"
+  },
+  "metadata": {
+    "description": "VAIBot circuit-breaker for Cursor — mandatory pre-execution governance with tamper-evident receipts."
+  },
+  "plugins": [
+    {
+      "name": "vaibot-cursor",
+      "source": ".",
+      "description": "Intercepts every tool call via Cursor hooks, classifies risk, and enforces policy (allow / ask / deny) before execution — with on-chain-anchorable governance receipts.",
+      "version": "0.1.0",
+      "author": { "name": "Campbell Labs LLC" },
+      "homepage": "https://www.vaibot.io",
+      "repository": "https://github.com/vaibot-io/cursor-circuitbreaker-plugin",
+      "license": "MIT",
+      "category": "Security",
+      "keywords": ["governance", "circuit-breaker", "agent-safety", "vaibot", "hooks", "audit", "provenance"]
+    }
+  ]
+}
