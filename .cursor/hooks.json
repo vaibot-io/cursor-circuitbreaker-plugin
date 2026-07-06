@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "node ./scripts/pre-tool-use.mjs",
+        "timeout": 15,
+        "failClosed": true
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "node ./scripts/pre-tool-use.mjs",
+        "timeout": 15,
+        "failClosed": true
+      }
+    ],
+    "afterShellExecution": [
+      {
+        "command": "node ./scripts/post-tool-use.mjs",
+        "timeout": 10
+      }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "node ./scripts/post-tool-use.mjs",
+        "timeout": 10
+      }
+    ]
+  }
+}
