@@ -29,7 +29,8 @@
     "guardrails"
   ],
   "files": [
-    ".cursor/",
+    ".cursor-plugin/",
+    "hooks/",
     "scripts/",
     "vendor/",
     "README.md",

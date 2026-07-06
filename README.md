@@ -34,9 +34,27 @@ On first tool call the plugin auto-bootstraps a free-tier VAIBot account using a
 
 To recover a lost key: run `vaibot login` (re-issues a key via your session) or set `VAIBOT_API_KEY`.
 
+## Plugin structure
+
+Per Cursor's [plugin reference](https://cursor.com/docs/reference/plugins), this repo is a single plugin:
+
+- **`.cursor-plugin/plugin.json`** — the required plugin manifest (`name`, version, description, `hooks` path).
+- **`hooks/hooks.json`** — the hook registration (auto-discovered), pointing at `scripts/pre-tool-use.mjs` (before Shell/MCP, `failClosed`) and `scripts/post-tool-use.mjs` (after).
+
+## Install / test locally
+
+Cursor loads local plugins from `~/.cursor/plugins/local/`:
+
+```sh
+# symlink this repo in, then restart Cursor (or "Developer: Reload Window")
+ln -s "$(pwd)" ~/.cursor/plugins/local/vaibot-cursor
+```
+
+For the marketplace: submit the public repo at [cursor.com/marketplace/publish](https://cursor.com/marketplace/publish) (plugins are Git repos, manually reviewed).
+
 ## Configuration
 
-Hooks are registered in [`.cursor/hooks.json`](./.cursor/hooks.json). Environment variables (shared with the other plugins):
+Environment variables (shared with the other plugins):
 
 - `VAIBOT_API_URL` — API base (default `https://api.vaibot.io`)
 - `VAIBOT_API_KEY` — bearer token (auto-provisioned if absent)
@@ -45,10 +63,9 @@ Hooks are registered in [`.cursor/hooks.json`](./.cursor/hooks.json). Environmen
 
 ## Open items (before GA)
 
-- **Live-test in Cursor** — validate the exact stdin/stdout shapes for `beforeShellExecution` / `beforeMCPExecution` against a real Cursor build.
-- **Distribution** — confirm how a packaged plugin's `.cursor/hooks.json` `command` path resolves (relative vs. a plugin-root variable), and publish to the Cursor plugin marketplace (repo `vaibot-io/cursor-circuitbreaker-plugin`).
+- **Live-test in Cursor** — validate the exact stdin/stdout shapes for `beforeShellExecution` / `beforeMCPExecution` against a real Cursor build (load locally via the step above).
 - **Tests** — `test/*.test.mjs` were copied from the Claude Code plugin and still assert Claude's I/O shapes; port them to Cursor's contract.
-- **CLI** — add `cursor` to `vaibot plugin add <host>`.
+- **CLI** — `vaibot plugin add cursor` is wired as a file-based host (command-cli); full auto-wiring of `~/.cursor` is a follow-up.
 
 ## License
 
