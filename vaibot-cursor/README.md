@@ -23,6 +23,8 @@ Each hook reads the pending action, classifies its risk, and returns a permissio
 
 Both hooks run with **`failClosed: true`** — if the hook crashes or times out, the action is blocked, not silently allowed. That's what makes enforcement *mandatory* rather than advisory. Every decision is recorded as a tamper-evident governance receipt (on-chain anchoring optional).
 
+**Enforce is the default posture.** Out of the box the decisions above are applied — risky actions are blocked or held for approval, not merely logged. The account's server-resolved mode is authoritative; `VAIBOT_MODE=observe` (opt-in) switches to log-only, and even then the catastrophic floor still blocks and a guard that goes unreachable fails *closed* to local enforcement.
+
 ## Install
 
 ```sh
@@ -39,7 +41,7 @@ To recover a lost key: run `vaibot login` (re-issues a key via your session) or 
 Per Cursor's [plugin reference](https://cursor.com/docs/reference/plugins):
 
 - **`.cursor-plugin/plugin.json`** — the required plugin manifest (`name`, version, description, `hooks` path).
-- **`.cursor-plugin/marketplace.json`** — marketplace manifest listing this plugin (`source: "."`); Cursor's add-a-repo flow expects it.
+- **`.cursor-plugin/marketplace.json`** (at the repo root, one level up) — marketplace manifest listing this plugin at `source: "vaibot-cursor"`; Cursor's add-a-repo flow expects it.
 - **`hooks/hooks.json`** — the hook registration (auto-discovered), pointing at `scripts/pre-tool-use.mjs` (before Shell/MCP, `failClosed`) and `scripts/post-tool-use.mjs` (after).
 
 ## Install / test locally
@@ -59,13 +61,18 @@ Environment variables (shared with the other plugins):
 
 - `VAIBOT_API_URL` — API base (default `https://api.vaibot.io`)
 - `VAIBOT_API_KEY` — bearer token (auto-provisioned if absent)
-- `VAIBOT_MODE` — `observe` (log-only) or `enforce` (default)
+- `VAIBOT_MODE` — `enforce` (**default** — blocks/prompts risky actions) or `observe` (opt-in, log-only)
 - `VAIBOT_TIMEOUT_MS` — request timeout (default 10000)
+
+## Tests
+
+`npm test` runs 25 `node:test` cases against Cursor's hook I/O contract —
+allow / ask / deny mapping, breaker trip / denylist / observe-branch, the no-key
+floor, nudge, fingerprint idempotency, state-file perms, and post-hook finalize.
 
 ## Open items (before GA)
 
 - **Live-test in Cursor** — validate the exact stdin/stdout shapes for `beforeShellExecution` / `beforeMCPExecution` against a real Cursor build (load locally via the step above).
-- **Tests** — `test/*.test.mjs` were copied from the Claude Code plugin and still assert Claude's I/O shapes; port them to Cursor's contract.
 - **CLI** — `vaibot plugin add cursor` is wired as a file-based host (command-cli); full auto-wiring of `~/.cursor` is a follow-up.
 
 ## License

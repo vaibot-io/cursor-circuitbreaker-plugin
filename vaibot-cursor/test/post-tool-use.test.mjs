@@ -30,6 +30,18 @@ function startMockServer(handler) {
   })
 }
 
+// Cursor after* event: afterShellExecution carries the same `generation_id`
+// (per-call correlation id) the before* hook stored as tool_use_id, so the
+// after hook can find the matching run state and finalize it. No exit_code /
+// tool_error → the tool succeeded → outcome 'allowed'.
+function afterShellEvent({ generation_id, conversation_id = 'sess_after', exit_code, duration_ms } = {}) {
+  const ev = { hook_event_name: 'afterShellExecution', conversation_id }
+  if (generation_id !== undefined) ev.generation_id = generation_id
+  if (exit_code !== undefined) ev.exit_code = exit_code
+  if (duration_ms !== undefined) ev.duration_ms = duration_ms
+  return ev
+}
+
 // Per-test isolated STATE_DIR (via TMPDIR) so parallel pre-hook runs in other
 // test files can't sweep/claim our seeded run-state. The guard is mocked via
 // VAIBOT_GUARD_BASE_URL so post-tool-use finalizes against the mock, not a real
@@ -53,13 +65,15 @@ function runPost({ apiUrl, input, fakeTmp }) {
   })
 }
 
-// Seed a runState file under the per-test fake TMPDIR as if PreToolUse wrote it.
+// Seed a runState file under the per-test fake TMPDIR (STATE_DIR = $TMPDIR/vaibot-cursor)
+// as if the before* hook wrote it. tool_name 'Shell' matches how the after* hook
+// reconstructs a shell event's tool name.
 function seedRunState(fakeTmp, toolUseId, approvalRequired, contentHash = 'sha256:x') {
-  const stateDir = join(fakeTmp, 'vaibot-claudecode')
+  const stateDir = join(fakeTmp, 'vaibot-cursor')
   mkdirSync(stateDir, { recursive: true })
   const path = join(stateDir, `${toolUseId}.json`)
   writeFileSync(path, JSON.stringify({
-    tool_name: 'Bash', tool_use_id: toolUseId,
+    tool_name: 'Shell', tool_use_id: toolUseId,
     run_id: `run_${toolUseId}`, content_hash: contentHash,
     approval_required: approvalRequired, ts: Date.now(),
   }))
@@ -67,11 +81,11 @@ function seedRunState(fakeTmp, toolUseId, approvalRequired, contentHash = 'sha25
 }
 
 test('approval_required runState → finalize via guard (no V2 /approve)', async () => {
-  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cc-post-'))
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cursor-post-'))
   seedRunState(fakeTmp, 'tu_yes', true, 'sha256:yes')
   const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
   try {
-    await runPost({ apiUrl: server.url, input: { tool_name: 'Bash', tool_use_id: 'tu_yes' }, fakeTmp })
+    await runPost({ apiUrl: server.url, input: afterShellEvent({ generation_id: 'tu_yes' }), fakeTmp })
     // The guard owns approvals — no V2 /approve PATCH. The native-UI approval is
     // captured by the finalize receipt; the guard's pending record self-expires.
     const approves = server.requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/approve'))
@@ -86,11 +100,11 @@ test('approval_required runState → finalize via guard (no V2 /approve)', async
 })
 
 test('runState → finalize via guard /v1/finalize/tool, no V2 calls', async () => {
-  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cc-post-'))
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cursor-post-'))
   seedRunState(fakeTmp, 'tu_plain', false)
   const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
   try {
-    await runPost({ apiUrl: server.url, input: { tool_name: 'Bash', tool_use_id: 'tu_plain' }, fakeTmp })
+    await runPost({ apiUrl: server.url, input: afterShellEvent({ generation_id: 'tu_plain' }), fakeTmp })
     const v2 = server.requests.filter((r) => r.url.startsWith('/v2/'))
     assert.equal(v2.length, 0)
     const finalizes = server.requests.filter((r) => r.url === '/v1/finalize/tool')

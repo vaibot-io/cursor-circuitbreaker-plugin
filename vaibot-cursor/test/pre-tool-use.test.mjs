@@ -13,15 +13,30 @@ const SCRIPT = join(__dirname, '..', 'scripts', 'pre-tool-use.mjs')
 
 // Mirror the pending path logic in pre-tool-use.mjs so tests can write/read
 // the same files without having to import the script (which has top-level await).
+// A Cursor shell event normalizes to toolName 'Shell', so the intent hash is
+// keyed on 'Shell' (not the Claude-Code 'Bash'); STATE_DIR is vaibot-cursor.
 function intentHash(tool, command, cwd) {
   return createHash('sha256').update(`${tool}|${command ?? ''}|${cwd ?? ''}`).digest('hex').slice(0, 32)
 }
 function pendingPath(tool, command, cwd) {
-  return join(tmpdir(), 'vaibot-claudecode', 'pending', `${intentHash(tool, command, cwd)}.json`)
+  return join(tmpdir(), 'vaibot-cursor', 'pending', `${intentHash(tool, command, cwd)}.json`)
 }
 function nudgeMarkerPath(sessionId) {
   const safe = createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 32)
-  return join(tmpdir(), 'vaibot-claudecode', 'nudged', safe)
+  return join(tmpdir(), 'vaibot-cursor', 'nudged', safe)
+}
+
+// ── Cursor input builders ────────────────────────────────────────────────────
+// Cursor delivers hook events on stdin keyed by `hook_event_name`. Shell commands
+// arrive as `beforeShellExecution` with a top-level `command` + `cwd`; MCP tool
+// calls as `beforeMCPExecution` with `tool_name` + `tool_input`. `conversation_id`
+// is the session id; `generation_id` is the per-call correlation id the before*
+// hook stores so the after* hook can pair with it. The hook normalizes a shell
+// event to toolName 'Shell' and an MCP event to 'MCP:'+tool_name.
+function shellEvent({ command, cwd = process.cwd(), conversation_id = 's', generation_id } = {}) {
+  const ev = { hook_event_name: 'beforeShellExecution', command, cwd, conversation_id }
+  if (generation_id !== undefined) ev.generation_id = generation_id
+  return ev
 }
 
 function startMockServer(handler) {
@@ -68,11 +83,11 @@ function seedCredsUrl(homeDir, { env = 'staging', url, apiKey } = {}) {
 
 function runHook({ apiUrl, mode = 'enforce', input }) {
   // Per-call fake HOME isolates the new breaker-state file at
-  // ~/.vaibot/breaker-state/claudecode.json from the user's real home and
-  // from other test runs. STATE_DIR (/tmp/vaibot-claudecode/) is intentionally
+  // ~/.vaibot/breaker-state/cursor.json from the user's real home and
+  // from other test runs. STATE_DIR (/tmp/vaibot-cursor/) is intentionally
   // NOT sandboxed here — existing tests reach into it via path helpers; the
-  // new breaker.test.mjs sandboxes it via TMPDIR for its own scenarios.
-  const fakeHome = mkdtempSync(join(tmpdir(), 'vaibot-claudecode-test-home-'))
+  // breaker.test.mjs sandboxes it via TMPDIR for its own scenarios.
+  const fakeHome = mkdtempSync(join(tmpdir(), 'vaibot-cursor-test-home-'))
   seedCredsUrl(fakeHome, { url: apiUrl, apiKey: 'test-key' }) // account base + key from the file (single store), no env override
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
@@ -106,7 +121,7 @@ function uniqCmd(prefix) {
   return `${prefix} ${Math.random().toString(36).slice(2)}`
 }
 
-test('enforce + allow → permissionDecision: allow, no finalize call', async () => {
+test('enforce + allow → permission: allow, no finalize call', async () => {
   const cmd = uniqCmd('echo hi')
   const cwd = process.cwd()
   const server = await startMockServer((req) => {
@@ -129,11 +144,11 @@ test('enforce + allow → permissionDecision: allow, no finalize call', async ()
   try {
     const res = await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: 's' },
+      input: shellEvent({ command: cmd, cwd, conversation_id: 's' }),
     })
     assert.equal(res.code, 0)
     const out = JSON.parse(res.stdout)
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
+    assert.equal(out.permission, 'allow')
     const finalizeCalls = server.requests.filter((r) => r.url.startsWith('/v2/governance/finalize/'))
     assert.equal(finalizeCalls.length, 0, 'no finalize on allow')
   } finally { await server.close() }
@@ -154,7 +169,7 @@ function decideHandler(decisionBody) {
 }
 
 function stateFilePath(toolUseId) {
-  return join(tmpdir(), 'vaibot-claudecode', `${toolUseId}.json`)
+  return join(tmpdir(), 'vaibot-cursor', `${toolUseId}.json`)
 }
 
 test('approval_required → native ask (not deny)', async () => {
@@ -164,11 +179,10 @@ test('approval_required → native ask (not deny)', async () => {
     content_hash: 'sha256:a', run_id: 'run_a', risk: { risk: 'high' },
   }))
   try {
-    const res = await runHook({ apiUrl: server.url, input: {
-      tool_name: 'Bash', tool_input: { command: uniqCmd('curl x') },
-      session_id: 's', tool_use_id: 'tu_ask1',
-    }})
-    assert.equal(JSON.parse(res.stdout).hookSpecificOutput.permissionDecision, 'ask')
+    const res = await runHook({ apiUrl: server.url, input: shellEvent({
+      command: uniqCmd('curl x'), conversation_id: 's', generation_id: 'tu_ask1',
+    }) })
+    assert.equal(JSON.parse(res.stdout).permission, 'ask')
   } finally {
     await server.close()
     try { rmSync(stateFilePath('tu_ask1')) } catch {}
@@ -181,10 +195,9 @@ test('approval_required → no finalize POSTed (receipt stays pending server-sid
     content_hash: 'sha256:b', run_id: 'run_b',
   }))
   try {
-    await runHook({ apiUrl: server.url, input: {
-      tool_name: 'Bash', tool_input: { command: uniqCmd('curl y') },
-      session_id: 's', tool_use_id: 'tu_ask2',
-    }})
+    await runHook({ apiUrl: server.url, input: shellEvent({
+      command: uniqCmd('curl y'), conversation_id: 's', generation_id: 'tu_ask2',
+    }) })
     const finalizes = server.requests.filter((r) => r.url.startsWith('/v2/governance/finalize/'))
     assert.equal(finalizes.length, 0)
   } finally {
@@ -199,10 +212,9 @@ test('approval_required → runState carries approval_required=true + content_ha
     content_hash: 'sha256:c', run_id: 'run_c',
   }))
   try {
-    await runHook({ apiUrl: server.url, input: {
-      tool_name: 'Bash', tool_input: { command: uniqCmd('curl z') },
-      session_id: 's', tool_use_id: 'tu_ask3',
-    }})
+    await runHook({ apiUrl: server.url, input: shellEvent({
+      command: uniqCmd('curl z'), conversation_id: 's', generation_id: 'tu_ask3',
+    }) })
     const state = JSON.parse(readFileSync(stateFilePath('tu_ask3'), 'utf-8'))
     assert.equal(state.approval_required, true)
     assert.equal(state.content_hash, 'sha256:c')
@@ -216,8 +228,8 @@ test('enforce + deny → deny output, pending file cleared', async () => {
   const cmd = uniqCmd('rm -rf /tmp/customer-export')
   const cwd = process.cwd()
   // Seed a pending file to verify it gets cleared
-  mkdirSync(dirname(pendingPath('Bash', cmd, cwd)), { recursive: true })
-  writeFileSync(pendingPath('Bash', cmd, cwd), JSON.stringify({ content_hash: 'sha256:stale', ts: 0 }))
+  mkdirSync(dirname(pendingPath('Shell', cmd, cwd)), { recursive: true })
+  writeFileSync(pendingPath('Shell', cmd, cwd), JSON.stringify({ content_hash: 'sha256:stale', ts: 0 }))
 
   const server = await startMockServer((req) => {
     if (req.url === '/v1/decide/tool') {
@@ -242,14 +254,16 @@ test('enforce + deny → deny output, pending file cleared', async () => {
   try {
     const res = await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: 's' },
+      input: shellEvent({ command: cmd, cwd, conversation_id: 's' }),
     })
+    // A policy deny is now emitDecision('deny') + exit 0 (Cursor reads the JSON),
+    // NOT exit 2 — that code is reserved for the top-level parse-failure safety net.
     assert.equal(res.code, 0)
     const out = JSON.parse(res.stdout)
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
+    assert.equal(out.permission, 'deny')
     // Pre-hook no longer finalizes on deny — the guard's decide receipt records
     // the verdict; finalize happens only for executed tools via post-tool-use.
-    assert.ok(!existsSync(pendingPath('Bash', cmd, cwd)), 'pending file cleared on deny')
+    assert.ok(!existsSync(pendingPath('Shell', cmd, cwd)), 'pending file cleared on deny')
   } finally { await server.close() }
 })
 
@@ -279,22 +293,22 @@ test('finalize network error does not block deny output', async () => {
   try {
     const res = await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: 's' },
+      input: shellEvent({ command: cmd, cwd, conversation_id: 's' }),
     })
     assert.equal(res.code, 0, 'pre-hook still exits 0')
     const out = JSON.parse(res.stdout)
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
+    assert.equal(out.permission, 'deny')
   } finally { await server.close() }
 })
 
-// Seed a stale ask-in-flight runState as if a prior PreToolUse emitted `ask`
-// and the user picked "No, tell Claude" (PostToolUse never fired to consume it).
+// Seed a stale ask-in-flight runState as if a prior before* hook emitted `ask`
+// and the user rejected the native prompt (no after* hook fired to consume it).
 function seedStaleAsk(contentHash, toolUseId = 'tu_old') {
-  const stateDir = join(tmpdir(), 'vaibot-claudecode')
+  const stateDir = join(tmpdir(), 'vaibot-cursor')
   mkdirSync(stateDir, { recursive: true })
   const path = join(stateDir, `${toolUseId}.json`)
   writeFileSync(path, JSON.stringify({
-    tool_name: 'Bash', tool_use_id: toolUseId,
+    tool_name: 'Shell', tool_use_id: toolUseId,
     content_hash: contentHash, approval_required: true, ts: Date.now(),
   }))
   return path
@@ -307,10 +321,9 @@ test('sweep: stale approval_required runState is cleaned locally (no network /de
     content_hash: 'sha256:next', run_id: 'run_next',
   }))
   try {
-    await runHook({ apiUrl: server.url, input: {
-      tool_name: 'Bash', tool_input: { command: uniqCmd('echo hi') },
-      session_id: 's', tool_use_id: 'tu_new',
-    }})
+    await runHook({ apiUrl: server.url, input: shellEvent({
+      command: uniqCmd('echo hi'), conversation_id: 's', generation_id: 'tu_new',
+    }) })
     // Guard approvals self-expire server-side; the sweep only removes stale
     // local run-state — no /deny PATCH is issued.
     const denies = server.requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/deny'))
@@ -326,8 +339,8 @@ test('retry with pending pointer: server returns previously_approved=true → al
   const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
   const cwd = process.cwd()
   // Seed pending file (simulates a prior approval_required)
-  mkdirSync(dirname(pendingPath('Bash', cmd, cwd)), { recursive: true })
-  writeFileSync(pendingPath('Bash', cmd, cwd), JSON.stringify({ content_hash: 'sha256:appr', ts: Date.now() }))
+  mkdirSync(dirname(pendingPath('Shell', cmd, cwd)), { recursive: true })
+  writeFileSync(pendingPath('Shell', cmd, cwd), JSON.stringify({ content_hash: 'sha256:appr', ts: Date.now() }))
 
   const server = await startMockServer((req) => {
     if (req.url === '/v1/decide/tool') {
@@ -351,12 +364,12 @@ test('retry with pending pointer: server returns previously_approved=true → al
   try {
     const res = await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: 's' },
+      input: shellEvent({ command: cmd, cwd, conversation_id: 's' }),
     })
     assert.equal(res.code, 0)
     const out = JSON.parse(res.stdout)
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
-    assert.ok(!existsSync(pendingPath('Bash', cmd, cwd)), 'pending file cleared after consumed approval')
+    assert.equal(out.permission, 'allow')
+    assert.ok(!existsSync(pendingPath('Shell', cmd, cwd)), 'pending file cleared after consumed approval')
   } finally { await server.close() }
 })
 
@@ -397,11 +410,11 @@ test('allow + claimed:false → stderr nudge fires on first tool call of session
   try {
     const res = await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: sessionId },
+      input: shellEvent({ command: cmd, cwd, conversation_id: sessionId }),
     })
     assert.equal(res.code, 0)
     const out = JSON.parse(res.stdout)
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'allow', 'decision is still allow')
+    assert.equal(out.permission, 'allow', 'decision is still allow')
     assert.match(res.stderr, /claim your account/i, 'nudge fires even on allow')
     assert.ok(existsSync(nudgeMarkerPath(sessionId)), 'marker created')
   } finally {
@@ -414,7 +427,7 @@ test('approval_required + claimed:false → stderr nudge written + marker create
   const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
   const cwd = process.cwd()
   const sessionId = `nudge-session-${Math.random().toString(36).slice(2)}`
-  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+  try { rmSync(pendingPath('Shell', cmd, cwd)) } catch {}
   try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
 
   const server = await startMockServer((req) => {
@@ -451,7 +464,7 @@ test('approval_required + claimed:false → stderr nudge written + marker create
   try {
     const res = await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: sessionId },
+      input: shellEvent({ command: cmd, cwd, conversation_id: sessionId }),
     })
     assert.equal(res.code, 0)
     assert.match(res.stderr, /claim your account/i)
@@ -459,7 +472,7 @@ test('approval_required + claimed:false → stderr nudge written + marker create
     assert.ok(existsSync(nudgeMarkerPath(sessionId)), 'nudge marker created')
   } finally {
     await server.close()
-    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+    try { rmSync(pendingPath('Shell', cmd, cwd)) } catch {}
     try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
   }
 })
@@ -468,7 +481,7 @@ test('approval_required + claimed:true → no nudge', async () => {
   const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
   const cwd = process.cwd()
   const sessionId = `nudge-claimed-${Math.random().toString(36).slice(2)}`
-  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+  try { rmSync(pendingPath('Shell', cmd, cwd)) } catch {}
   try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
 
   const server = await startMockServer((req) => {
@@ -500,14 +513,14 @@ test('approval_required + claimed:true → no nudge', async () => {
   try {
     const res = await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: sessionId },
+      input: shellEvent({ command: cmd, cwd, conversation_id: sessionId }),
     })
     assert.equal(res.code, 0)
     assert.doesNotMatch(res.stderr, /claim your account/i)
     assert.ok(!existsSync(nudgeMarkerPath(sessionId)), 'nudge marker NOT created')
   } finally {
     await server.close()
-    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+    try { rmSync(pendingPath('Shell', cmd, cwd)) } catch {}
   }
 })
 
@@ -515,7 +528,7 @@ test('approval_required + nudge marker already present → no second nudge', asy
   const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
   const cwd = process.cwd()
   const sessionId = `nudge-twice-${Math.random().toString(36).slice(2)}`
-  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+  try { rmSync(pendingPath('Shell', cmd, cwd)) } catch {}
 
   // Pre-seed the marker
   mkdirSync(dirname(nudgeMarkerPath(sessionId)), { recursive: true })
@@ -549,14 +562,14 @@ test('approval_required + nudge marker already present → no second nudge', asy
   try {
     const res = await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: sessionId },
+      input: shellEvent({ command: cmd, cwd, conversation_id: sessionId }),
     })
     assert.equal(res.code, 0)
     assert.doesNotMatch(res.stderr, /claim your account/i)
     assert.equal(meCalls, 0, '/accounts/me not called when marker already exists')
   } finally {
     await server.close()
-    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+    try { rmSync(pendingPath('Shell', cmd, cwd)) } catch {}
     try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
   }
 })
@@ -566,7 +579,7 @@ test('approval_required + nudge marker already present → no second nudge', asy
 // different working directories on the same machine MUST send the same
 // fingerprint to /v2/bootstrap. Previously the fingerprint included process.cwd
 // and a developer would accumulate one bootstrap_accounts row per cwd they ever
-// launched Claude Code from.
+// launched the agent from.
 
 test('bootstrap fingerprint is identical across different cwds (no cwd in formula)', async () => {
   // Two empty tmp dirs to use as cwd. They differ in path; same machine, same user.
@@ -640,9 +653,10 @@ test('bootstrap fingerprint is identical across different cwds (no cwd in formul
       child.on('error', reject)
       child.on('exit', (code) => resolve({ code, stdout, stderr }))
       child.stdin.write(JSON.stringify({
-        tool_name: 'Bash',
-        tool_input: { command: 'echo test', cwd },
-        session_id: 'fp-session',
+        hook_event_name: 'beforeShellExecution',
+        command: 'echo test',
+        cwd,
+        conversation_id: 'fp-session',
       }))
       child.stdin.end()
     })
@@ -674,7 +688,7 @@ test('bootstrap fingerprint is identical across different cwds (no cwd in formul
   }
 })
 
-const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')
+const STATE_DIR = join(tmpdir(), 'vaibot-cursor')
 
 test('STATE_DIR is created 0o700 and saved state files are 0o600 (no metadata leak on shared hosts)', async () => {
   try { rmSync(STATE_DIR, { recursive: true, force: true }) } catch {}
@@ -692,7 +706,7 @@ test('STATE_DIR is created 0o700 and saved state files are 0o600 (no metadata le
   try {
     await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: uniqCmd('echo perms') }, session_id: 'sess_perms', tool_use_id: 'tu_perms' },
+      input: shellEvent({ command: uniqCmd('echo perms'), conversation_id: 'sess_perms', generation_id: 'tu_perms' }),
     })
 
     const dirMode = statSync(STATE_DIR).mode & 0o777
@@ -733,7 +747,7 @@ test('STATE_DIR perms are tightened on the fly when a legacy 0o755 dir already e
   try {
     await runHook({
       apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: uniqCmd('echo chmod') }, session_id: 'sess_chmod', tool_use_id: 'tu_chmod' },
+      input: shellEvent({ command: uniqCmd('echo chmod'), conversation_id: 'sess_chmod', generation_id: 'tu_chmod' }),
     })
     assert.equal(statSync(STATE_DIR).mode & 0o777, 0o700, 'legacy dir should be tightened to 0o700')
   } finally {

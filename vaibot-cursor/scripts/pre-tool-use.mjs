@@ -15,7 +15,7 @@
  * Environment variables:
  *   VAIBOT_API_URL    — base URL of the VAIBot v2 API (default: https://api.vaibot.io)
  *   VAIBOT_API_KEY    — Bearer token for the governance API (auto-provisioned if missing)
- *   VAIBOT_MODE       — "observe" or "enforce" (default: enforce)
+ *   VAIBOT_MODE       — "enforce" (default) or "observe" (opt-in, log-only)
  *   VAIBOT_TIMEOUT_MS — request timeout in ms (default: 10000)
  *
  * Output (stdout, before* events): { permission, user_message, agent_message }
