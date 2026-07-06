@@ -24,13 +24,15 @@ Most deployments use both: the plugin for mandatory pre-execution enforcement, t
 
 ## Quick start
 
-**Add the plugin in Cursor.** Cursor plugins are distributed as Git repositories. Add this one as a marketplace, then install it:
+**Add the plugin in Cursor.** Cursor plugins are distributed as Git repositories, imported as a marketplace:
 
-1. In Cursor, open **Customize** (or Settings → Plugins) and add the marketplace repo `vaibot-io/cursor-circuitbreaker-plugin`.
-2. Install **vaibot-cursor** from it.
+1. In the Cursor **Dashboard → Plugins**, under **Team Marketplaces**, click **Add Marketplace → Import from Repo** and enter `vaibot-io/cursor-circuitbreaker-plugin`.
+2. In Cursor, open **Customize** in the sidebar, find **vaibot-cursor** in that marketplace, and install it.
 3. Restart Cursor, or run **Developer: Reload Window**.
 
-**Local / development install** — symlink the plugin into Cursor's local-plugins folder:
+(Once it's listed on the official Cursor Marketplace, you'll be able to install it straight from **Customize** without the import step.)
+
+**Local / development install** — skip the marketplace and symlink the plugin into Cursor's local-plugins folder:
 
 ```bash
 ln -s /path/to/cursor-circuitbreaker-plugin ~/.cursor/plugins/local/vaibot-cursor
@@ -195,6 +197,24 @@ Cursor                          VAIBot API                    On-chain
 ## Plugin layout
 
 Per Cursor's [plugin reference](https://cursor.com/docs/reference/plugins), the repo root **is** the plugin (single-plugin layout):
+
+```
+cursor-circuitbreaker-plugin/       # the repo root IS the plugin
+├── .cursor-plugin/
+│   ├── plugin.json                 # required manifest (name, hooks path)
+│   └── marketplace.json            # add-a-repo manifest (source: ".")
+├── hooks/
+│   └── hooks.json                  # registers before/after Shell + MCP hooks
+├── scripts/
+│   ├── pre-tool-use.mjs            # enforcement — before* hooks, failClosed
+│   └── post-tool-use.mjs           # finalize receipt — after* hooks
+├── vendor/vaibot-guard/            # shared @vaibot/guard (classifier, breaker, …)
+├── test/                           # 25 node:test cases (Cursor hook I/O)
+├── package.json
+├── CHANGELOG.md
+├── LICENSE
+└── README.md
+```
 
 - **`.cursor-plugin/plugin.json`** — the plugin manifest.
 - **`.cursor-plugin/marketplace.json`** — marketplace manifest (`source: "."`) for Cursor's add-a-repo flow; a single plugin also installs with just `plugin.json`.
