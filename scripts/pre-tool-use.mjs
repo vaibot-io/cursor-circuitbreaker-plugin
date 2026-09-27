@@ -40,6 +40,7 @@ import {
 import { classify, VERDICT } from '../vendor/vaibot-guard/scripts/classifier.mjs'
 import { ensureGuardDefault } from '../vendor/vaibot-guard/scripts/lib/guard-launch.mjs'
 import { decideViaGuard } from '../vendor/vaibot-guard/scripts/lib/guard-client.mjs'
+import { readContainment } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
 import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -634,6 +635,25 @@ async function main() {
   // Cursor names MCP tools by their bare tool name, so match the vaibot namespace
   // by name rather than Claude Code's `mcp__vaibot` prefix.
   if (isMcp && /vaibot/i.test(rawToolName)) {
+    process.exit(0)
+  }
+
+  // CONTAINMENT — checked before the key gate, the guard call, the breaker, and
+  // every degraded path below. Those paths are exactly the ones an account-wide
+  // stop has to survive: a call that never reaches the daemon would otherwise be
+  // governed locally by the classifier, or allowed outright under observe /
+  // fail-open. The machine-wide record needs no daemon, no network and no
+  // credentials, so it is readable on every one of them.
+  //
+  // Deliberately AFTER the governance-tool skip: an operator must be able to
+  // inspect the account and lift containment while it is engaged, which is the
+  // same exemption the guard's own classifier makes for a governance self-call.
+  const containment = readContainment()
+  if (containment.contained) {
+    const why = containment.reason ? ` (${containment.reason})` : ''
+    const reason = `VAIBot containment engaged${why} — every action on this account is blocked, on every machine. Lift it from the dashboard or with \`vaibot release\`.`
+    emitDecision('deny', { agent: reason })
+    process.stderr.write(`VAIBot: ${reason}\n`)
     process.exit(0)
   }
 

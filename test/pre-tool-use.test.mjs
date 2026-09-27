@@ -81,7 +81,7 @@ function seedCredsUrl(homeDir, { env = 'staging', url, apiKey } = {}) {
   writeFileSync(file, JSON.stringify(store))
 }
 
-function runHook({ apiUrl, mode = 'enforce', input }) {
+function runHook({ apiUrl, mode = 'enforce', input, containment = null, extraEnv = {} }) {
   // Per-call fake HOME isolates the new breaker-state file at
   // ~/.vaibot/breaker-state/cursor.json from the user's real home and
   // from other test runs. STATE_DIR (/tmp/vaibot-cursor/) is intentionally
@@ -89,6 +89,14 @@ function runHook({ apiUrl, mode = 'enforce', input }) {
   // breaker.test.mjs sandboxes it via TMPDIR for its own scenarios.
   const fakeHome = mkdtempSync(join(tmpdir(), 'vaibot-cursor-test-home-'))
   seedCredsUrl(fakeHome, { url: apiUrl, apiKey: 'test-key' }) // account base + key from the file (single store), no env override
+  // Containment is machine-wide, in the shared rendezvous dir the guard owns —
+  // seeded here so the hook reads it the way a real breaker does, with no daemon.
+  // A string is written verbatim so a test can seed a corrupt record.
+  if (containment) {
+    const guardDir = join(fakeHome, '.vaibot', 'guard')
+    mkdirSync(guardDir, { recursive: true })
+    writeFileSync(join(guardDir, 'containment.json'), typeof containment === 'string' ? containment : JSON.stringify(containment))
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
       env: {
@@ -100,6 +108,7 @@ function runHook({ apiUrl, mode = 'enforce', input }) {
         VAIBOT_API_KEY: 'test-key',
         VAIBOT_MODE: mode,
         VAIBOT_TIMEOUT_MS: '2000',
+        ...extraEnv,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
@@ -753,5 +762,80 @@ test('STATE_DIR perms are tightened on the fly when a legacy 0o755 dir already e
   } finally {
     await server.close()
     try { rmSync(STATE_DIR, { recursive: true, force: true }) } catch {}
+  }
+})
+
+// ── Containment ───────────────────────────────────────────────────────────────
+// Containment is the account-wide stop. The guard enforces it for any call that
+// reaches the daemon; these tests pin the half the breaker owns — the paths where
+// the daemon is never consulted, which are exactly the paths a stop has to
+// survive. The record needs no daemon, no network and no credentials, so each
+// case also asserts the mock server was never called.
+
+const CONTAINED = { contained: true, reason: 'laptop looks compromised', at: new Date().toISOString() }
+
+test('contained: a shell call is denied, and the guard is never consulted', async () => {
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const res = await runHook({
+      apiUrl: server.url,
+      containment: CONTAINED,
+      input: shellEvent({ command: uniqCmd('echo hi'), conversation_id: 'c1' }),
+    })
+    const out = JSON.parse(res.stdout)
+    assert.equal(out.permission, 'deny')
+    assert.match(out.agent_message, /containment engaged/i)
+    assert.match(out.agent_message, /laptop looks compromised/, 'the engage reason should reach the agent')
+    assert.equal(server.requests.length, 0, 'containment must not need the daemon or the control plane')
+  } finally {
+    await server.close()
+  }
+})
+
+test('contained: observe mode does NOT lift it — nothing else survives observe', async () => {
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const res = await runHook({
+      apiUrl: server.url,
+      mode: 'observe',
+      containment: CONTAINED,
+      input: shellEvent({ command: uniqCmd('echo hi'), conversation_id: 'c2' }),
+    })
+    assert.equal(JSON.parse(res.stdout).permission, 'deny')
+    assert.equal(server.requests.length, 0)
+  } finally {
+    await server.close()
+  }
+})
+
+test('contained: VAIBOT_FAIL_OPEN does NOT lift it — the fail-open path is the point', async () => {
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const res = await runHook({
+      apiUrl: server.url,
+      containment: CONTAINED,
+      extraEnv: { VAIBOT_FAIL_OPEN: 'true' },
+      input: shellEvent({ command: uniqCmd('echo hi'), conversation_id: 'c3' }),
+    })
+    assert.equal(JSON.parse(res.stdout).permission, 'deny')
+    assert.equal(server.requests.length, 0)
+  } finally {
+    await server.close()
+  }
+})
+
+test('a corrupt containment record does not claim containment', async () => {
+  // The breaker reads this on every tool call; it must never take the hook down,
+  // and must never fail INTO a stop.
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const res = await runHook({
+      apiUrl: server.url,
+      containment: '{ not json',
+      input: shellEvent({ command: uniqCmd('echo hi'), conversation_id: 'c4' }),
+    })
+    assert.ok(!/containment engaged/i.test(res.stdout), 'an unreadable record must not read as contained')
+  } finally {
+    await server.close()
   }
 })
