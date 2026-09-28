@@ -118,7 +118,20 @@ async function main() {
   const { isMcp, rawToolName, toolName, toolUseId, sessionId, error, durationMs } = normalizeAfterEvent(hookInput)
 
   // Skip VAIBot's own governance MCP tools (never governed → nothing to finalize).
-  if (isMcp && /vaibot/i.test(rawToolName)) process.exit(0)
+  // Governance tools are exempt so a governance call cannot recurse into governing
+  // itself, and so an operator can still lift containment from inside the agent.
+  //
+  // Anchored at the namespace boundary. This was `/vaibot/i` unanchored, which
+  // matched the substring ANYWHERE in the name: a tool called `list_vaibot_rows`
+  // from any server at all was handed an exemption, and so was a server named
+  // `vaibotage`. The check runs before the containment check below, so that was a
+  // way around the account-wide stop.
+  //
+  // Cursor's MCP event carries only `tool_name` -- no server identity -- so this
+  // can only match on the tool name. A server that deliberately named its tool
+  // `vaibot_x` would still be exempt; closing that needs a server identity Cursor
+  // does not give this hook.
+  if (isMcp && /^vaibot(_|$)/i.test(rawToolName)) process.exit(0)
 
   const runState = findRunState(toolName, toolUseId)
   if (!runState?.run_id) process.exit(0)
