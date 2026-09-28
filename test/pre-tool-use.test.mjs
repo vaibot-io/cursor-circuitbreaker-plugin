@@ -33,6 +33,12 @@ function nudgeMarkerPath(sessionId) {
 // is the session id; `generation_id` is the per-call correlation id the before*
 // hook stores so the after* hook can pair with it. The hook normalizes a shell
 // event to toolName 'Shell' and an MCP event to 'MCP:'+tool_name.
+function mcpEvent({ tool_name, tool_input = {}, conversation_id = 's', generation_id } = {}) {
+  const ev = { hook_event_name: 'beforeMCPExecution', tool_name, tool_input, conversation_id }
+  if (generation_id !== undefined) ev.generation_id = generation_id
+  return ev
+}
+
 function shellEvent({ command, cwd = process.cwd(), conversation_id = 's', generation_id } = {}) {
   const ev = { hook_event_name: 'beforeShellExecution', command, cwd, conversation_id }
   if (generation_id !== undefined) ev.generation_id = generation_id
@@ -821,6 +827,46 @@ test('contained: VAIBOT_FAIL_OPEN does NOT lift it — the fail-open path is the
     assert.equal(server.requests.length, 0)
   } finally {
     await server.close()
+  }
+})
+
+test('contained: a look-alike MCP tool gets no exemption — the match is anchored', async () => {
+  // This was `/vaibot/i` UNANCHORED, so the substring anywhere in the name earned
+  // an exemption: `list_vaibot_rows` from any server at all, and anything a server
+  // called `vaibotage` exposed. The exemption is checked before containment, so it
+  // was a way around the account-wide stop.
+  for (const tool_name of ['vaibotage_run', 'list_vaibot_rows', 'evil_vaibot', 'notvaibot_x']) {
+    const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+    try {
+      const res = await runHook({
+        apiUrl: server.url,
+        containment: CONTAINED,
+        input: mcpEvent({ tool_name, conversation_id: 'c_sq' }),
+      })
+      const out = JSON.parse(res.stdout)
+      assert.equal(out.permission, 'deny', `${tool_name} must not be exempt`)
+      assert.match(out.agent_message, /containment engaged/i)
+    } finally {
+      await server.close()
+    }
+  }
+})
+
+test('the real governance tools are still exempt, so an operator can lift it', async () => {
+  // Cursor names MCP tools bare, so the namespace here is the `vaibot_` prefix.
+  for (const tool_name of ['vaibot', 'vaibot_status', 'vaibot_approve', 'VAIBOT_STATUS']) {
+    const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+    try {
+      const res = await runHook({
+        apiUrl: server.url,
+        containment: CONTAINED,
+        input: mcpEvent({ tool_name, conversation_id: 'c_gov' }),
+      })
+      assert.equal(res.code, 0, `${tool_name} must stay usable`)
+      assert.equal(res.stdout.trim(), '', `${tool_name} must not be gated`)
+    } finally {
+      await server.close()
+    }
   }
 })
 
