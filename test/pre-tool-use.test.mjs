@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
+import { runKey } from '../scripts/lib/call-key.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SCRIPT = join(__dirname, '..', 'scripts', 'pre-tool-use.mjs')
@@ -183,8 +184,9 @@ function decideHandler(decisionBody) {
   return (req) => (req.url === '/v1/decide/tool' ? { status: 200, body } : { status: 200, body: { ok: true } })
 }
 
-function stateFilePath(toolUseId) {
-  return join(tmpdir(), 'vaibot-cursor', `${toolUseId}.json`)
+// Run-state is keyed on the generation plus the exact call (scripts/lib/call-key.mjs).
+function stateFilePath(toolUseId, command) {
+  return join(tmpdir(), 'vaibot-cursor', `${runKey({ genId: toolUseId, toolName: 'Shell', command })}.json`)
 }
 
 test('approval_required → native ask (not deny)', async () => {
@@ -193,14 +195,15 @@ test('approval_required → native ask (not deny)', async () => {
     shadow_decision: { decision: 'approval_required', reason: 'High-risk' },
     content_hash: 'sha256:a', run_id: 'run_a', risk: { risk: 'high' },
   }))
+  const cmd = uniqCmd('curl x')
   try {
     const res = await runHook({ apiUrl: server.url, input: shellEvent({
-      command: uniqCmd('curl x'), conversation_id: 's', generation_id: 'tu_ask1',
+      command: cmd, conversation_id: 's', generation_id: 'tu_ask1',
     }) })
     assert.equal(JSON.parse(res.stdout).permission, 'ask')
   } finally {
     await server.close()
-    try { rmSync(stateFilePath('tu_ask1')) } catch {}
+    try { rmSync(stateFilePath('tu_ask1', cmd)) } catch {}
   }
 })
 
@@ -209,15 +212,16 @@ test('approval_required → no finalize POSTed (receipt stays pending server-sid
     decision: { decision: 'approval_required' }, shadow_decision: { decision: 'approval_required' },
     content_hash: 'sha256:b', run_id: 'run_b',
   }))
+  const cmd = uniqCmd('curl y')
   try {
     await runHook({ apiUrl: server.url, input: shellEvent({
-      command: uniqCmd('curl y'), conversation_id: 's', generation_id: 'tu_ask2',
+      command: cmd, conversation_id: 's', generation_id: 'tu_ask2',
     }) })
     const finalizes = server.requests.filter((r) => r.url.startsWith('/v2/governance/finalize/'))
     assert.equal(finalizes.length, 0)
   } finally {
     await server.close()
-    try { rmSync(stateFilePath('tu_ask2')) } catch {}
+    try { rmSync(stateFilePath('tu_ask2', cmd)) } catch {}
   }
 })
 
@@ -226,16 +230,17 @@ test('approval_required → runState carries approval_required=true + content_ha
     decision: { decision: 'approval_required' }, shadow_decision: { decision: 'approval_required' },
     content_hash: 'sha256:c', run_id: 'run_c',
   }))
+  const askCmd = uniqCmd('curl z')
   try {
     await runHook({ apiUrl: server.url, input: shellEvent({
-      command: uniqCmd('curl z'), conversation_id: 's', generation_id: 'tu_ask3',
+      command: askCmd, conversation_id: 's', generation_id: 'tu_ask3',
     }) })
-    const state = JSON.parse(readFileSync(stateFilePath('tu_ask3'), 'utf-8'))
+    const state = JSON.parse(readFileSync(stateFilePath('tu_ask3', askCmd), 'utf-8'))
     assert.equal(state.approval_required, true)
     assert.equal(state.content_hash, 'sha256:c')
   } finally {
     await server.close()
-    try { rmSync(stateFilePath('tu_ask3')) } catch {}
+    try { rmSync(stateFilePath('tu_ask3', askCmd)) } catch {}
   }
 })
 
@@ -883,5 +888,24 @@ test('a corrupt containment record does not claim containment', async () => {
     assert.ok(!/containment engaged/i.test(res.stdout), 'an unreadable record must not read as contained')
   } finally {
     await server.close()
+  }
+})
+
+test('two calls in one turn (same generation_id) keep separate run-state', async () => {
+  // generation_id changes per user message, so it alone named one file for the
+  // whole turn and each call overwrote the last one's run-state.
+  const server = await startMockServer(decideHandler({
+    decision: { decision: 'allow' }, shadow_decision: { decision: 'allow' }, content_hash: 'sha256:s', run_id: 'run_s',
+  }))
+  const a = uniqCmd('echo a'), b = uniqCmd('echo b')
+  try {
+    await runHook({ apiUrl: server.url, input: shellEvent({ command: a, conversation_id: 's', generation_id: 'gen_same' }) })
+    await runHook({ apiUrl: server.url, input: shellEvent({ command: b, conversation_id: 's', generation_id: 'gen_same' }) })
+    assert.ok(existsSync(stateFilePath('gen_same', a)), 'the first call\'s run-state survives the second')
+    assert.ok(existsSync(stateFilePath('gen_same', b)))
+  } finally {
+    await server.close()
+    try { rmSync(stateFilePath('gen_same', a)) } catch {}
+    try { rmSync(stateFilePath('gen_same', b)) } catch {}
   }
 })

@@ -2,6 +2,26 @@
 
 All notable changes to `@vaibot/cursor-circuitbreaker-plugin`.
 
+## [Unreleased]
+
+### Fixed
+- **A "Yes" in Cursor's prompt no longer gets the next identical command denied.**
+  After the user approved an `ask` and the command ran, the after* hook finalized
+  `{ outcome: "allowed" }`: no `approval`, and the retry pointer left behind. Running the
+  same command again presented the guard's still-**pending** approval id and was denied,
+  `Approval not approved (status=pending)`. The after* hook now spends the pointer and
+  finalizes with `approval: "approved"`. That's also what lets guard 2.3.1 mark the
+  approval `used` instead of leaving it pending on the dashboard until its TTL.
+- **The after* hook closes exactly the call it ran.** Cursor's `generation_id` "changes
+  with every user message", so it's shared by every call in a turn, but run-state was
+  keyed on it alone. A second call in the turn overwrote the first's run-state, and
+  when an after* hook found no entry it fell back to "the newest entry for this tool",
+  which belonged to another call. In a reproduction, approving in one conversation
+  finalized **another conversation's** still-pending call as having run. Run-state is
+  now keyed on the generation plus the exact call (Shell: the command; MCP: tool and
+  input, both fields both hooks receive). The fallback is gone.
+- **Durations are recorded.** Cursor sends `duration`; the hook read `duration_ms`.
+
 ## [0.2.2] — 2026-09-28 — the governance exemption, and guard 2.3.0
 
 ### Changed

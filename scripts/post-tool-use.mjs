@@ -17,6 +17,7 @@ import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readLock } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
+import { runKey, parseMcpInput } from './lib/call-key.mjs'
 
 // Stable identity for this agent's per-machine state — must match the before*
 // hook (pre-tool-use.mjs) so the run-state files line up.
@@ -38,51 +39,38 @@ function resolveGuard() {
 }
 
 const STATE_DIR = join(tmpdir(), `vaibot-${AGENT_ID}`)
+const PENDING_DIR = join(STATE_DIR, 'pending')
 const MAX_STATE_AGE_MS = 5 * 60 * 1000 // 5 minutes
 
-function findRunState(toolName, toolUseId) {
+// Expire ordinary entries after 5 min. Ask-in-flight entries live until this
+// after* hook or a later before* sweep resolves them — a human decision can
+// outlast the normal expiry window.
+function expireStaleRunState() {
   try {
-    const files = readdirSync(STATE_DIR).filter(f => f.endsWith('.json'))
     const now = Date.now()
-    let bestMatch = null
-    let bestTs = 0
-
-    for (const file of files) {
+    for (const file of readdirSync(STATE_DIR).filter((f) => f.endsWith('.json'))) {
       try {
         const data = JSON.parse(readFileSync(join(STATE_DIR, file), 'utf-8'))
-
-        // Expire ordinary entries after 5min. Ask-in-flight entries live until
-        // a hook sweeps them (this after* hook, or a later before* sweep) —
-        // human decisions can outlast the normal expiry window.
-        if (!data.approval_required && now - data.ts > MAX_STATE_AGE_MS) {
-          try { unlinkSync(join(STATE_DIR, file)) } catch { /* ignore */ }
-          continue
-        }
-
-        // Prefer exact tool_use_id (generation_id) match; fall back to most-recent tool_name.
-        if (toolUseId && data.tool_use_id === toolUseId) {
-          bestMatch = { ...data, file }
-          break
-        }
-        if (data.tool_name === toolName && data.ts > bestTs) {
-          bestMatch = { ...data, file }
-          bestTs = data.ts
-        }
-      } catch { /* ignore corrupt files */ }
+        if (!data.approval_required && now - data.ts > MAX_STATE_AGE_MS) unlinkSync(join(STATE_DIR, file))
+      } catch { /* ignore corrupt or vanished files */ }
     }
+  } catch { /* no state dir */ }
+}
 
-    // Claim the matched state file before any network call. If a parallel
-    // sweep beats us to the unlink, abandon the match so we don't double-
-    // resolve the same receipt.
-    if (bestMatch) {
-      try { unlinkSync(join(STATE_DIR, bestMatch.file)) }
-      catch { return null }
-    }
-
-    return bestMatch
-  } catch {
-    return null
-  }
+// The run-state of THIS call, by the key the before* hook saved it under (the
+// generation plus the exact call). There is deliberately no fallback to "the
+// newest entry for this tool": that entry belongs to a different call — another
+// command, or another conversation's — and finalizing it records a result, and
+// an approval, for a call that never produced them.
+//
+// Claimed by unlinking BEFORE any network call: if a parallel sweep wins the
+// unlink, this hook backs off rather than double-resolve the receipt.
+function takeRunState(key) {
+  const file = join(STATE_DIR, `${key}.json`)
+  let data
+  try { data = JSON.parse(readFileSync(file, 'utf-8')) } catch { return null }
+  try { unlinkSync(file) } catch { return null }
+  return data
 }
 
 // ── Cursor input adapter ─────────────────────────────────────────────────────
@@ -95,13 +83,21 @@ function normalizeAfterEvent(ev) {
   const isMcp = event === 'afterMCPExecution' || event === 'beforeMCPExecution'
   const rawToolName = isMcp ? (ev.tool_name ?? ev.toolName ?? 'unknown') : 'Shell'
   const toolName = isMcp ? `MCP:${rawToolName}` : 'Shell'
-  const toolUseId = ev.generation_id ?? ev.generationId ?? ev.tool_use_id ?? ev.toolUseId ?? null
+  const genId = ev.generation_id ?? ev.generationId ?? null
+  const key = runKey({
+    genId,
+    toolName,
+    command: ev.command ?? '',
+    mcpInput: isMcp ? parseMcpInput(ev.tool_input ?? ev.toolInput) : undefined,
+  })
   const sessionId = ev.conversation_id ?? ev.conversationId ?? AGENT_ID
   const exitCode = ev.exit_code ?? ev.exitCode ?? null
   const error =
     ev.tool_error ?? ev.error ?? (typeof exitCode === 'number' && exitCode !== 0 ? `exit code ${exitCode}` : null)
-  const durationMs = ev.duration_ms ?? ev.durationMs ?? null
-  return { isMcp, rawToolName, toolName, toolUseId, sessionId, error, durationMs }
+  // Cursor sends `duration` (ms, excluding approval wait); `duration_ms` is kept
+  // for older payloads.
+  const durationMs = ev.duration ?? ev.duration_ms ?? ev.durationMs ?? null
+  return { isMcp, rawToolName, toolName, key, sessionId, error, durationMs }
 }
 
 async function main() {
@@ -115,7 +111,7 @@ async function main() {
     process.exit(0)
   }
 
-  const { isMcp, rawToolName, toolName, toolUseId, sessionId, error, durationMs } = normalizeAfterEvent(hookInput)
+  const { isMcp, rawToolName, toolName, key, sessionId, error, durationMs } = normalizeAfterEvent(hookInput)
 
   // Skip VAIBot's own governance MCP tools (never governed → nothing to finalize).
   // Governance tools are exempt so a governance call cannot recurse into governing
@@ -133,14 +129,24 @@ async function main() {
   // does not give this hook.
   if (isMcp && /^vaibot(_|$)/i.test(rawToolName)) process.exit(0)
 
-  const runState = findRunState(toolName, toolUseId)
+  expireStaleRunState()
+  const runState = takeRunState(key)
   if (!runState?.run_id) process.exit(0)
+
+  // An after* hook firing for an ask-in-flight means the user clicked "Yes" in
+  // Cursor's prompt and the call ran. That answer spends the call's retry
+  // pointer: left behind, the next identical command presented the guard's
+  // still-pending approval id and was denied (`Approval not approved
+  // (status=pending)`). Dropped before the guard lookup so it goes even when the
+  // guard is unreachable.
+  const nativelyApproved = runState.approval_required === true
+  if (nativelyApproved && runState.intent_key) {
+    try { unlinkSync(join(PENDING_DIR, `${runState.intent_key}.json`)) } catch { /* may not exist */ }
+  }
 
   // Receipt exists and needs closing.
   // Direction A: finalize through the local guard (it proves the finalize
   // receipt). The guard recovers the session from the runId's stored context.
-  // The 'ask' approval the user granted in Cursor's native prompt is captured
-  // by the finalize receipt; the guard's pending approval record self-expires.
   const guard = resolveGuard()
   if (!guard) {
     process.stderr.write(
@@ -151,6 +157,11 @@ async function main() {
 
   const outcome = error ? 'blocked' : 'allowed'
   const result = { outcome }
+  // `ok: false` is what the guard reads as "the action failed".
+  if (error) result.ok = false
+  // The answer the user gave, stated rather than inferred: it is what spends the
+  // guard's approval record (used) instead of leaving it pending until its TTL.
+  if (nativelyApproved) result.approval = 'approved'
   if (typeof durationMs === 'number') result.duration_ms = durationMs
   if (error) result.error = String(error).slice(0, 2000)
 
