@@ -5,6 +5,16 @@ All notable changes to `@vaibot/cursor-circuitbreaker-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **One conversation no longer clears another's open approval prompt.** The ask
+  sweep, which runs on every before* hook, cleared **any** pending ask except the current
+  generation's, across every Cursor conversation on the machine. A call in one
+  conversation deleted another conversation's ask while its prompt was still open, so
+  that conversation's "Yes" had nothing to finalize. The sweep now clears an ask only
+  when it belongs to **this** conversation and an **earlier** user message (the user has
+  moved on, so that prompt is over), or when it has been abandoned for over a day.
+  Run-state now records its `conversation_id`. As before, nothing is recorded for a
+  cleared ask: Cursor reports no answer to an ask, and its transcripts carry no tool
+  results, so a "No" can't be told apart from a stop or an unanswered prompt.
 - **A "Yes" in Cursor's prompt no longer gets the next identical command denied.**
   After the user approved an `ask` and the command ran, the after* hook finalized
   `{ outcome: "allowed" }`: no `approval`, and the retry pointer left behind. Running the
