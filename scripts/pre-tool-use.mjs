@@ -41,6 +41,7 @@ import { classify, VERDICT } from '../vendor/vaibot-guard/scripts/classifier.mjs
 import { ensureGuardDefault } from '../vendor/vaibot-guard/scripts/lib/guard-launch.mjs'
 import { decideViaGuard } from '../vendor/vaibot-guard/scripts/lib/guard-client.mjs'
 import { readContainment } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
+import { runKey } from './lib/call-key.mjs'
 import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -531,11 +532,6 @@ function extractCwd(toolName, input) {
   return process.cwd()
 }
 
-function stableHash(obj) {
-  const json = JSON.stringify(obj, Object.keys(obj).sort())
-  return createHash('sha256').update(json).digest('hex').slice(0, 16)
-}
-
 // ── Cursor input adapter ─────────────────────────────────────────────────────
 // Cursor delivers the event JSON on stdin and identifies the event via
 // `hook_event_name`:
@@ -707,7 +703,11 @@ async function main() {
 
   const command = extractCommand(toolName, toolInput)
   const cwd = extractCwd(toolName, toolInput)
-  const toolCallId = toolUseId ?? stableHash({ toolName, ...toolInput, ts: Date.now() })
+  // Run-state is keyed on THIS call — the generation plus the exact call — so the
+  // after* hook closes the call it ran (see lib/call-key.mjs). generation_id is
+  // per user message, shared by every call in the turn: keyed on it alone, one
+  // call's state overwrote another's.
+  const toolCallId = runKey({ genId, toolName, command: toolInput.command, mcpInput: toolInput })
 
   // Retry awareness: if we previously got approval_required for this exact
   // intent and saved a pointer, present it to the guard for redemption.
