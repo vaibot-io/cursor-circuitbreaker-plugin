@@ -1,11 +1,25 @@
 #!/usr/bin/env node
 /**
- * VAIBot Cursor afterShellExecution / afterMCPExecution hook.
+ * VAIBot Cursor postToolUse / postToolUseFailure hook (matcher `Shell|MCP:`).
  *
  * Cursor delivers the event JSON on stdin. This is a fire-and-forget hook (no
  * permission decision): it finds the matching run state saved by the before*
  * hook and finalizes through the local VAIBot guard's /v1/finalize/tool (which
  * proves the finalize receipt) to close the run. It always exits 0.
+ *
+ * Why the generic hooks and not afterShellExecution / afterMCPExecution (which
+ * this used to be). Observed in cursor-agent 2026.10.01, every Shell and MCP call
+ * fires the specific after* hook first and then the generic one:
+ *   - a non-zero exit arrives as postToolUseFailure (failure_type "error",
+ *     error_message "Command failed with exit code 7"); afterShellExecution fires
+ *     too but carries no exit code, so a failed command was finalized as allowed;
+ *   - an MCP call whose server returns a protocol error fires ONLY
+ *     postToolUseFailure — afterMCPExecution never fires, so that run was never
+ *     finalized at all;
+ *   - an MCP result with isError:true is a postToolUse; the error is visible
+ *     only inside tool_output.
+ * Only one hook pair may finalize: the run-state is claimed by unlink, so with
+ * both registered the after* hook would win the race without an exit code.
  *
  * Environment variables:
  *   VAIBOT_GUARD_BASE_URL — override the local guard URL (else discovered from the lock file)
@@ -74,30 +88,56 @@ function takeRunState(key) {
 }
 
 // ── Cursor input adapter ─────────────────────────────────────────────────────
-// Branch on `hook_event_name` to reconstruct the same { toolName, toolUseId }
-// the before* hook stored: afterShellExecution → 'Shell'; afterMCPExecution →
-// 'MCP:'+tool_name. The outcome is derived from whatever result fields Cursor
-// provides (a non-zero exit code or an explicit error → 'blocked').
-function normalizeAfterEvent(ev) {
+// The generic hooks name the tool the way the before* hook stores it: 'Shell',
+// or 'MCP:'+tool_name. tool_input is an object (Shell: { command, cwd, timeout };
+// MCP: the arguments), which keys identically to the before* hook's command /
+// parsed JSON-string input. Anything else (Read, Write, …) is not governed here.
+//
+// The failure, from what Cursor reports:
+//   postToolUseFailure      → error_message (or failure_type)
+//   postToolUse, Shell      → tool_output.exitCode ≠ 0 (defensive: Cursor routes
+//                             a non-zero exit to postToolUseFailure)
+//   postToolUse, MCP        → tool_output.isError (the server's error result)
+function parseToolOutput(raw) {
+  if (raw && typeof raw === 'object') return raw
+  try { return JSON.parse(raw) } catch { return null }
+}
+
+function mcpErrorText(output) {
+  const text = Array.isArray(output?.content)
+    ? output.content.filter((c) => c?.type === 'text').map((c) => c.text).join('\n')
+    : ''
+  return text || 'MCP tool returned an error'
+}
+
+function normalizePostEvent(ev) {
   const event = ev.hook_event_name ?? ev.hookEventName ?? ''
-  const isMcp = event === 'afterMCPExecution' || event === 'beforeMCPExecution'
-  const rawToolName = isMcp ? (ev.tool_name ?? ev.toolName ?? 'unknown') : 'Shell'
-  const toolName = isMcp ? `MCP:${rawToolName}` : 'Shell'
-  const genId = ev.generation_id ?? ev.generationId ?? null
+  const toolName = String(ev.tool_name ?? ev.toolName ?? '')
+  const isMcp = toolName.startsWith('MCP:')
+  if (!isMcp && toolName !== 'Shell') return null
+  const rawToolName = isMcp ? toolName.slice('MCP:'.length) : 'Shell'
+  const toolInput = parseMcpInput(ev.tool_input ?? ev.toolInput)
   const key = runKey({
-    genId,
+    genId: ev.generation_id ?? ev.generationId ?? null,
     toolName,
-    command: ev.command ?? '',
-    mcpInput: isMcp ? parseMcpInput(ev.tool_input ?? ev.toolInput) : undefined,
+    command: toolInput.command ?? '',
+    mcpInput: isMcp ? toolInput : undefined,
   })
   const sessionId = ev.conversation_id ?? ev.conversationId ?? AGENT_ID
-  const exitCode = ev.exit_code ?? ev.exitCode ?? null
-  const error =
-    ev.tool_error ?? ev.error ?? (typeof exitCode === 'number' && exitCode !== 0 ? `exit code ${exitCode}` : null)
-  // Cursor sends `duration` (ms, excluding approval wait); `duration_ms` is kept
-  // for older payloads.
-  const durationMs = ev.duration ?? ev.duration_ms ?? ev.durationMs ?? null
-  return { isMcp, rawToolName, toolName, key, sessionId, error, durationMs }
+
+  let error = null
+  let failureType = null
+  if (event === 'postToolUseFailure') {
+    failureType = ev.failure_type ?? 'error'
+    error = ev.error_message || failureType
+  } else {
+    const output = parseToolOutput(ev.tool_output)
+    if (!isMcp && typeof output?.exitCode === 'number' && output.exitCode !== 0) error = `exit code ${output.exitCode}`
+    if (isMcp && output?.isError === true) error = mcpErrorText(output)
+  }
+  // Cursor sends `duration` (ms, excluding approval wait).
+  const durationMs = ev.duration ?? ev.duration_ms ?? null
+  return { isMcp, rawToolName, key, sessionId, error, failureType, durationMs }
 }
 
 async function main() {
@@ -111,7 +151,16 @@ async function main() {
     process.exit(0)
   }
 
-  const { isMcp, rawToolName, toolName, key, sessionId, error, durationMs } = normalizeAfterEvent(hookInput)
+  const call = normalizePostEvent(hookInput)
+  if (!call) process.exit(0)
+  const { isMcp, rawToolName, key, sessionId, error, failureType, durationMs } = call
+
+  // A denied call never ran. Whether Cursor's permission_denied means the user
+  // declined the before* hook's ask, or another hooks.json source denied it (any
+  // deny wins over ask), is not yet established — so this is left exactly as it
+  // was before this hook existed: the run-state stays for the ask sweep, and
+  // nothing is claimed about who said no.
+  if (failureType === 'permission_denied') process.exit(0)
 
   // Skip VAIBot's own governance MCP tools (never governed → nothing to finalize).
   // Governance tools are exempt so a governance call cannot recurse into governing
@@ -133,8 +182,8 @@ async function main() {
   const runState = takeRunState(key)
   if (!runState?.run_id) process.exit(0)
 
-  // An after* hook firing for an ask-in-flight means the user clicked "Yes" in
-  // Cursor's prompt and the call ran. That answer spends the call's retry
+  // A post hook firing for an ask-in-flight means the user clicked "Yes" in
+  // Cursor's prompt and the call ran (a failure or timeout still ran it). That answer spends the call's retry
   // pointer: left behind, the next identical command presented the guard's
   // still-pending approval id and was denied (`Approval not approved
   // (status=pending)`). Dropped before the guard lookup so it goes even when the

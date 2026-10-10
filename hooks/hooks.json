@@ -14,15 +14,17 @@
         "failClosed": true
       }
     ],
-    "afterShellExecution": [
+    "postToolUse": [
       {
         "command": "node ./scripts/post-tool-use.mjs",
+        "matcher": "Shell|MCP:",
         "timeout": 10
       }
     ],
-    "afterMCPExecution": [
+    "postToolUseFailure": [
       {
         "command": "node ./scripts/post-tool-use.mjs",
+        "matcher": "Shell|MCP:",
         "timeout": 10
       }
     ]

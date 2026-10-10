@@ -189,9 +189,9 @@ Cursor                          VAIBot API                    On-chain
    │                                │                            │
    ├─ [tool executes or blocked]    │                            │
    │                                │                            │
-   ├─ afterShellExecution ─────────►│                            │
-   │  afterMCPExecution             ├─ finalizeReceipt()         │
-   │  (outcome, duration)           │                            │
+   ├─ postToolUse ─────────────────►│                            │
+   │  postToolUseFailure            ├─ finalizeReceipt()         │
+   │  (outcome, ok, duration)       │                            │
 ```
 
 ## Plugin layout
@@ -204,10 +204,10 @@ cursor-circuitbreaker-plugin/       # the repo root IS the plugin
 │   ├── plugin.json                 # required manifest (name, hooks path)
 │   └── marketplace.json            # add-a-repo manifest (source: ".")
 ├── hooks/
-│   └── hooks.json                  # registers before/after Shell + MCP hooks
+│   └── hooks.json                  # registers before* Shell + MCP, post* Shell|MCP: hooks
 ├── scripts/
 │   ├── pre-tool-use.mjs            # enforcement — before* hooks, failClosed
-│   └── post-tool-use.mjs           # finalize receipt — after* hooks
+│   └── post-tool-use.mjs           # finalize receipt — postToolUse / postToolUseFailure
 ├── vendor/vaibot-guard/            # shared @vaibot/guard (classifier, breaker, …)
 ├── test/                           # 25 node:test cases (Cursor hook I/O)
 ├── package.json
@@ -218,7 +218,7 @@ cursor-circuitbreaker-plugin/       # the repo root IS the plugin
 
 - **`.cursor-plugin/plugin.json`** — the plugin manifest.
 - **`.cursor-plugin/marketplace.json`** — marketplace manifest (`source: "."`) for Cursor's add-a-repo flow; a single plugin also installs with just `plugin.json`.
-- **`hooks/hooks.json`** — hook registration (auto-discovered): `beforeShellExecution` / `beforeMCPExecution` → `scripts/pre-tool-use.mjs` (`failClosed`), `afterShellExecution` / `afterMCPExecution` → `scripts/post-tool-use.mjs`.
+- **`hooks/hooks.json`** — hook registration (auto-discovered): `beforeShellExecution` / `beforeMCPExecution` → `scripts/pre-tool-use.mjs` (`failClosed`), `postToolUse` / `postToolUseFailure` (matcher `Shell|MCP:`) → `scripts/post-tool-use.mjs`. The generic post hooks, not `afterShellExecution` / `afterMCPExecution`: only they report a failed command (`afterShellExecution` has no exit code) and an MCP call whose server errors (`afterMCPExecution` doesn't fire for it).
 - **`vendor/vaibot-guard/`** — the shared `@vaibot/guard` surface (classifier, breaker, guard client, creds).
 
 ## Skipped tools

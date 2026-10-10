@@ -5,6 +5,19 @@ All notable changes to `@vaibot/cursor-circuitbreaker-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **Failed tool calls are recorded as failed, and an MCP call whose server errors is
+  recorded at all.** Receipts were finalized from `afterShellExecution` /
+  `afterMCPExecution`. Observed in cursor-agent 2026.10.01: `afterShellExecution`
+  carries no exit code, so a command that failed was finalized as allowed; and when an
+  MCP server returns a protocol error, `afterMCPExecution` doesn't fire at all, so that
+  run was never finalized. Finalizing now comes from Cursor's generic `postToolUse` /
+  `postToolUseFailure` hooks (matcher `Shell|MCP:`), which fire for every Shell and MCP
+  call: a `postToolUseFailure` (non-zero exit, timeout, server error) or an MCP result
+  with `isError: true` is sent as `ok: false` with Cursor's error message. The after*
+  hooks are no longer registered: both fire for every call, after* first, and would
+  claim the run without an exit code. A `permission_denied` failure is left alone (no
+  finalize, run-state kept for the ask sweep) until it is established whether Cursor
+  sends it for a user's "No" or also for another hook's deny.
 - **One conversation no longer clears another's open approval prompt.** The ask
   sweep, which runs on every before* hook, cleared **any** pending ask except the current
   generation's, across every Cursor conversation on the machine. A call in one
