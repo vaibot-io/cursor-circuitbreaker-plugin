@@ -397,15 +397,34 @@ function saveRunState(toolCallId, state) {
 // When a before* hook emitted `permission: 'ask'`, the runState carries
 // `approval_required: true`. If the user approves, the after* hook fires and
 // consumes the entry (finalizing the receipt). If the user rejects, no after*
-// hook fires — the entry remains until the next before* hook of a later tool
-// call sweeps it.
+// hook fires, so a later before* hook clears the entry here.
 //
-// Race note: claim the entry by unlinking it BEFORE issuing the network call.
-// Whichever process wins the unlink owns the resolution; the loser (e.g. an
-// after* hook running in parallel) sees ENOENT and bails out. This keeps the
-// receipt event chain coherent even if hook processes overlap.
+// Only an entry that is known to be over is cleared. The state dir is shared by
+// every Cursor conversation on the machine, and this used to clear ANY ask
+// except the current generation's — including another conversation's ask whose
+// prompt was still open, so that conversation's "Yes" then found nothing to
+// finalize. Now an entry is cleared only when it belongs to THIS conversation
+// and an EARLIER user message (generation_id changes per user message: the user
+// has moved on, so that prompt is no longer open), or when it is abandoned.
+//
+// Nothing is recorded for a cleared entry. Cursor reports no answer to an ask,
+// and its transcript has no tool results, so a "No" cannot be told apart from a
+// stop or a prompt that was never answered — claiming a denial would put a
+// decision in the user's mouth. Guard approvals self-expire.
+//
+// Race note: claim the entry by unlinking it BEFORE acting. Whichever process
+// wins the unlink owns the resolution; the loser (e.g. an after* hook running in
+// parallel) sees ENOENT and bails out.
 
-async function sweepPendingApprovals({ excludeToolUseId } = {}) {
+const ASK_ABANDON_MS = 24 * 60 * 60 * 1000
+
+function askIsOver(entry, { conversationId, generationId, now = Date.now() }) {
+  if (typeof entry.ts === 'number' && now - entry.ts > ASK_ABANDON_MS) return true // abandoned, any conversation
+  if (!entry.conversation_id || entry.conversation_id !== conversationId) return false // not ours: its prompt may be open
+  return Boolean(generationId) && entry.tool_use_id !== generationId // ours, from an earlier user message
+}
+
+async function sweepPendingApprovals({ conversationId, generationId } = {}) {
   let files
   try {
     files = readdirSync(STATE_DIR).filter((f) => f.endsWith('.json'))
@@ -417,13 +436,10 @@ async function sweepPendingApprovals({ excludeToolUseId } = {}) {
     try { entry = JSON.parse(readFileSync(path, 'utf-8')) } catch { continue }
 
     if (!entry?.approval_required) continue
-    if (excludeToolUseId && entry.tool_use_id === excludeToolUseId) continue
-    if (!entry.content_hash) { try { unlinkSync(path) } catch {} ; continue }
+    if (!askIsOver(entry, { conversationId, generationId })) continue
 
     try { unlinkSync(path) } catch { continue }  // lost the race — another hook is handling it
 
-    // Guard approvals self-expire server-side; the sweep only cleans stale
-    // local run-state (no network call).
     if (entry.intent_key) {
       try { unlinkSync(join(PENDING_DIR, `${entry.intent_key}.json`)) } catch {}
     }
@@ -684,10 +700,9 @@ async function main() {
     }
   }
 
-  // Resolve any still-pending ask-in-flight from a prior tool call. If the user
-  // rejected a previous `ask`, no after* hook fired — so this sweep is the first
-  // place the denial gets recorded server-side.
-  await sweepPendingApprovals({ excludeToolUseId: toolUseId })
+  // Clear asks that are over: this conversation's, from an earlier user message
+  // (no after* hook fired, so it was not approved), or abandoned. Records nothing.
+  await sweepPendingApprovals({ conversationId: sessionId, generationId: genId })
 
   // ── Breaker check (before any API call) ──
   // Load persisted state from disk and check trip. Tripped → decide locally and
@@ -819,6 +834,8 @@ async function main() {
       tool_name: toolName,
       tool_call_id: toolCallId,
       tool_use_id: toolUseId,
+      // Which conversation's prompt this is: the sweep only ever clears its own.
+      conversation_id: sessionId,
       approval_required: rawDecision === 'approval_required' && !data.previously_approved,
       intent_key: intentHash(toolName, command, cwd),
       ts: Date.now(),

@@ -321,37 +321,96 @@ test('finalize network error does not block deny output', async () => {
   } finally { await server.close() }
 })
 
-// Seed a stale ask-in-flight runState as if a prior before* hook emitted `ask`
-// and the user rejected the native prompt (no after* hook fired to consume it).
-function seedStaleAsk(contentHash, toolUseId = 'tu_old') {
-  const stateDir = join(tmpdir(), 'vaibot-cursor')
-  mkdirSync(stateDir, { recursive: true })
-  const path = join(stateDir, `${toolUseId}.json`)
-  writeFileSync(path, JSON.stringify({
-    tool_name: 'Shell', tool_use_id: toolUseId,
-    content_hash: contentHash, approval_required: true, ts: Date.now(),
-  }))
-  return path
+// The sweep clears only an ask that is known to be over: this conversation's,
+// from an earlier user message — or one abandoned for over a day. The state dir
+// is shared by every Cursor conversation, and clearing another conversation's
+// open ask left its "Yes" with nothing to finalize. Each scenario runs in its own
+// TMPDIR so other suites' sweeps can't touch the seeded entries.
+function sweepScenario(entries) {
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cursor-sweep-'))
+  const stateDir = join(fakeTmp, 'vaibot-cursor')
+  mkdirSync(join(stateDir, 'pending'), { recursive: true })
+  const paths = {}
+  for (const [name, fields] of Object.entries(entries)) {
+    paths[name] = join(stateDir, `${name}.json`)
+    writeFileSync(paths[name], JSON.stringify({
+      tool_name: 'Shell', run_id: `run_${name}`, content_hash: `appr_${name}`, approval_required: true,
+      intent_key: `ik_${name}`, ts: Date.now(), ...fields,
+    }))
+    writeFileSync(join(stateDir, 'pending', `ik_${name}.json`), '{}')
+  }
+  const pointer = (name) => join(stateDir, 'pending', `ik_${name}.json`)
+  return { fakeTmp, paths, pointer }
 }
 
-test('sweep: stale approval_required runState is cleaned locally (no network /deny)', async () => {
-  const stalePath = seedStaleAsk('sha256:stale')
+async function sweepFrom(fakeTmp, { conversation_id, generation_id }) {
   const server = await startMockServer(decideHandler({
-    decision: { decision: 'allow' }, shadow_decision: { decision: 'allow' },
-    content_hash: 'sha256:next', run_id: 'run_next',
+    decision: { decision: 'allow' }, shadow_decision: { decision: 'allow' }, content_hash: 'sha256:next', run_id: 'run_next',
   }))
   try {
-    await runHook({ apiUrl: server.url, input: shellEvent({
-      command: uniqCmd('echo hi'), conversation_id: 's', generation_id: 'tu_new',
-    }) })
-    // Guard approvals self-expire server-side; the sweep only removes stale
-    // local run-state — no /deny PATCH is issued.
-    const denies = server.requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/deny'))
-    assert.equal(denies.length, 0)
-    assert.ok(!existsSync(stalePath), 'stale ask-in-flight run-state cleaned')
+    await runHook({ apiUrl: server.url, extraEnv: { TMPDIR: fakeTmp }, input: shellEvent({ command: uniqCmd('echo hi'), conversation_id, generation_id }) })
+    return server.requests
   } finally {
     await server.close()
-    try { rmSync(stalePath) } catch {}
+  }
+}
+
+test('sweep: another conversation\'s open ask is left alone (entry + pointer survive)', async () => {
+  const sc = sweepScenario({ other: { conversation_id: 'conv_other', tool_use_id: 'gen_o1' } })
+  try {
+    await sweepFrom(sc.fakeTmp, { conversation_id: 'conv_me', generation_id: 'gen_m5' })
+    assert.ok(existsSync(sc.paths.other), 'its prompt may still be open')
+    assert.ok(existsSync(sc.pointer('other')))
+  } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
+})
+
+test('sweep: this conversation\'s ask from an EARLIER user message is cleared, claiming nothing', async () => {
+  const sc = sweepScenario({ mine_old: { conversation_id: 'conv_me', tool_use_id: 'gen_m1' } })
+  try {
+    const requests = await sweepFrom(sc.fakeTmp, { conversation_id: 'conv_me', generation_id: 'gen_m2' })
+    assert.ok(!existsSync(sc.paths.mine_old), 'the user moved on: that prompt is over')
+    assert.ok(!existsSync(sc.pointer('mine_old')))
+    assert.equal(requests.filter((r) => r.method === 'PATCH' || r.url === '/v1/finalize/tool').length, 0, 'no denial is claimed')
+  } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
+})
+
+test('sweep: this conversation\'s ask from the CURRENT user message is left alone', async () => {
+  const sc = sweepScenario({ mine_now: { conversation_id: 'conv_me', tool_use_id: 'gen_m3' } })
+  try {
+    await sweepFrom(sc.fakeTmp, { conversation_id: 'conv_me', generation_id: 'gen_m3' })
+    assert.ok(existsSync(sc.paths.mine_now))
+  } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
+})
+
+test('sweep: an ask abandoned for over a day is cleared whatever its conversation; a recent legacy entry is kept', async () => {
+  const day = 25 * 60 * 60 * 1000
+  const sc = sweepScenario({
+    stale_other: { conversation_id: 'conv_other', tool_use_id: 'gen_x', ts: Date.now() - day },
+    stale_legacy: { tool_use_id: 'gen_y', ts: Date.now() - day },
+    recent_legacy: { tool_use_id: 'gen_z' },
+  })
+  try {
+    await sweepFrom(sc.fakeTmp, { conversation_id: 'conv_me', generation_id: 'gen_m9' })
+    assert.ok(!existsSync(sc.paths.stale_other))
+    assert.ok(!existsSync(sc.paths.stale_legacy))
+    assert.ok(existsSync(sc.paths.recent_legacy), 'no conversation id: it cannot be attributed, so it waits out the cutoff')
+  } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
+})
+
+test('runState records the conversation it belongs to', async () => {
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cursor-sweep-'))
+  const server = await startMockServer(decideHandler({
+    decision: { decision: 'approval_required' }, shadow_decision: { decision: 'approval_required' }, content_hash: 'sha256:c', run_id: 'run_c',
+  }))
+  try {
+    await runHook({ apiUrl: server.url, extraEnv: { TMPDIR: fakeTmp }, input: shellEvent({ command: uniqCmd('curl q'), conversation_id: 'conv_rec', generation_id: 'gen_rec' }) })
+    const dir = join(fakeTmp, 'vaibot-cursor')
+    const entries = readdirSync(dir).filter((f) => f.endsWith('.json')).map((f) => JSON.parse(readFileSync(join(dir, f), 'utf-8')))
+    assert.equal(entries.length, 1)
+    assert.equal(entries[0].conversation_id, 'conv_rec')
+  } finally {
+    await server.close()
+    rmSync(fakeTmp, { recursive: true, force: true })
   }
 })
 
